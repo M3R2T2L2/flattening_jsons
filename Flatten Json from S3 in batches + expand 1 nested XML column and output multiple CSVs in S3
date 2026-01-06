@@ -1,0 +1,311 @@
+# -----------------------------
+# Flatten JSON from S3 in batches + expand ONE nested XML column
+# Output: MULTIPLE CSV PART FILES in S3
+#   s3://bucket/output_prefix/part-000001.csv
+#   s3://bucket/output_prefix/part-000002.csv
+#   ...
+# -----------------------------
+import json
+import re
+import io
+import math
+import logging
+from typing import Any, Dict, List, Optional
+from xml.etree import ElementTree as ET
+
+import boto3
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+# -------------------------
+# XML helpers
+# -------------------------
+_XML_LIKE_RE = re.compile(r"<[^>]+>.*</[^>]+>", re.DOTALL)
+
+def looks_like_xml(s: Any) -> bool:
+    if not isinstance(s, str):
+        return False
+    s2 = s.strip()
+    if len(s2) < 5:
+        return False
+    return bool(_XML_LIKE_RE.search(s2))
+
+def parse_xml_to_flat_dict(xml_str: str, sep: str = ".", prefix: str = "") -> Dict[str, Any]:
+    """
+    Parse XML string into a flat dict using tag paths.
+    Repeated tags: values joined with " | ".
+    If XML malformed, fallback regex extracts simple <tag>value</tag> pairs.
+    """
+    xml_str = (xml_str or "").strip()
+    out: Dict[str, Any] = {}
+
+    def _add(key: str, val: Any):
+        if key in out and out[key] not in (None, ""):
+            out[key] = f"{out[key]} | {val}"
+        else:
+            out[key] = val
+
+    try:
+        root = ET.fromstring(xml_str)
+
+        def walk(node: ET.Element, path: List[str]):
+            tag = (node.tag or "").strip()
+            new_path = path + ([tag] if tag else [])
+            txt = (node.text or "").strip()
+            if txt:
+                key = sep.join(new_path)
+                if prefix:
+                    key = f"{prefix}{sep}{key}"
+                _add(key, txt)
+            for child in list(node):
+                walk(child, new_path)
+
+        walk(root, [])
+        return out
+
+    except Exception:
+        pairs = re.findall(r"<([A-Za-z0-9_:\-\.]+)>(.*?)</\1>", xml_str, flags=re.DOTALL)
+        for tag, val in pairs:
+            val2 = re.sub(r"\s+", " ", val).strip()
+            key = tag.strip()
+            if prefix:
+                key = f"{prefix}{sep}{key}"
+            _add(key, val2)
+        return out
+
+# -------------------------
+# S3 listing + reading
+# -------------------------
+def list_s3_keys(s3_client, bucket: str, prefix: str) -> List[str]:
+    keys: List[str] = []
+    token: Optional[str] = None
+
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+
+        resp = s3_client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            k = obj["Key"]
+            if k.endswith("/"):
+                continue
+            if k.lower().endswith(".json"):
+                keys.append(k)
+
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+
+    return keys
+
+def read_json_from_s3(s3_client, bucket: str, key: str) -> Any:
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    raw = obj["Body"].read()
+    text = raw.decode("utf-8", errors="replace")
+    return json.loads(text)
+
+def normalize_records(json_data: Any) -> List[Dict[str, Any]]:
+    if isinstance(json_data, list):
+        return [x if isinstance(x, dict) else {"value": x} for x in json_data]
+    if isinstance(json_data, dict):
+        return [json_data]
+    return [{"value": json_data}]
+
+# -------------------------
+# Record processing
+# -------------------------
+def build_row_from_record(
+    rec: Dict[str, Any],
+    columns_to_keep: List[str],
+    nested_column: str,
+    sep: str = ".",
+    nested_prefix: Optional[str] = None,
+    keep_raw_nested_xml: bool = False
+) -> Dict[str, Any]:
+    """
+    Keep only non-nested columns + expanded XML fields from nested_column.
+    If keep_raw_nested_xml=True, also keeps the original nested_column content.
+    """
+    row: Dict[str, Any] = {}
+
+    # Keep requested top-level fields
+    for c in columns_to_keep:
+        row[c] = rec.get(c)
+
+    xml_val = rec.get(nested_column)
+
+    if isinstance(xml_val, str) and looks_like_xml(xml_val):
+        prefix = nested_prefix if nested_prefix is not None else nested_column
+        row.update(parse_xml_to_flat_dict(xml_val, sep=sep, prefix=prefix))
+        if keep_raw_nested_xml:
+            row[nested_column] = xml_val
+    else:
+        # If not XML-like, keep as-is (optional)
+        if keep_raw_nested_xml:
+            row[nested_column] = xml_val
+
+    return row
+
+# -------------------------
+# CSV writer to S3 (part files)
+# -------------------------
+def df_to_csv_bytes(df: pd.DataFrame, include_header: bool = True) -> bytes:
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, header=include_header)
+    return buf.getvalue().encode("utf-8")
+
+def put_csv_part_to_s3(
+    s3_client,
+    bucket: str,
+    out_prefix: str,
+    part_num: int,
+    df: pd.DataFrame,
+    include_header: bool = True
+) -> str:
+    out_prefix = out_prefix.lstrip("/")
+    if out_prefix and not out_prefix.endswith("/"):
+        out_prefix += "/"
+    key = f"{out_prefix}part-{part_num:06d}.csv"
+    body = df_to_csv_bytes(df, include_header=include_header)
+    s3_client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="text/csv")
+    return key
+
+# -------------------------
+# Main pipeline
+# -------------------------
+def process_s3_json_to_csv_parts(
+    s3_bucket: str,
+    s3_input_prefix: str,
+    s3_output_prefix: str,
+    columns_to_keep: List[str],
+    nested_column: str,
+    batch_size_files: int = 200,
+    rows_per_part: int = 250_000,
+    sep: str = ".",
+    add_source_columns: bool = True,
+    keep_raw_nested_xml: bool = False,
+    include_header_each_part: bool = True
+) -> None:
+    """
+    Writes multiple part CSVs to:
+      s3://bucket/s3_output_prefix/part-000001.csv
+      ...
+
+    - rows_per_part controls how many output rows go into each CSV file.
+    - include_header_each_part=True is usually best for independent part files.
+      If you plan to "cat" them later into one file, set it to False after part 1.
+    """
+    s3 = boto3.client("s3")
+    keys = list_s3_keys(s3, s3_bucket, s3_input_prefix)
+    if not keys:
+        raise FileNotFoundError(f"No JSON files found under s3://{s3_bucket}/{s3_input_prefix}")
+
+    logging.info(f"Found {len(keys):,} JSON files under s3://{s3_bucket}/{s3_input_prefix}")
+    logging.info(f"Writing CSV parts to s3://{s3_bucket}/{s3_output_prefix.rstrip('/')}/")
+
+    part_num = 1
+    total_rows = 0
+    total_files = 0
+    errors = 0
+
+    buffer_rows: List[Dict[str, Any]] = []
+
+    def flush_part(rows: List[Dict[str, Any]], part_num: int) -> Tuple[int, str]:
+        df = pd.DataFrame(rows)
+        key = put_csv_part_to_s3(
+            s3_client=s3,
+            bucket=s3_bucket,
+            out_prefix=s3_output_prefix,
+            part_num=part_num,
+            df=df,
+            include_header=include_header_each_part
+        )
+        return len(df), key
+
+    for batch_start in range(0, len(keys), batch_size_files):
+        batch_keys = keys[batch_start: batch_start + batch_size_files]
+        logging.info(f"Batch files {batch_start+1:,}-{batch_start+len(batch_keys):,} / {len(keys):,}")
+
+        for k in batch_keys:
+            total_files += 1
+            try:
+                jd = read_json_from_s3(s3, s3_bucket, k)
+                records = normalize_records(jd)
+            except Exception as e:
+                errors += 1
+                logging.exception(f"Failed reading/parsing {k}: {e}")
+                continue
+
+            for i, rec in enumerate(records):
+                if not isinstance(rec, dict):
+                    rec = {"value": rec}
+
+                row = build_row_from_record(
+                    rec=rec,
+                    columns_to_keep=columns_to_keep,
+                    nested_column=nested_column,
+                    sep=sep,
+                    nested_prefix=nested_column,
+                    keep_raw_nested_xml=keep_raw_nested_xml
+                )
+
+                if add_source_columns:
+                    row["_source_key"] = k
+                    row["_source_index"] = i
+
+                buffer_rows.append(row)
+                total_rows += 1
+
+                if len(buffer_rows) >= rows_per_part:
+                    n, out_key = flush_part(buffer_rows, part_num)
+                    logging.info(f"Wrote part {part_num:06d}: {n:,} rows -> s3://{s3_bucket}/{out_key}")
+                    buffer_rows = []
+                    part_num += 1
+
+    # flush remainder
+    if buffer_rows:
+        n, out_key = flush_part(buffer_rows, part_num)
+        logging.info(f"Wrote part {part_num:06d}: {n:,} rows -> s3://{s3_bucket}/{out_key}")
+        buffer_rows = []
+        part_num += 1
+
+    logging.info(
+        f"Done. Files processed: {total_files:,} | rows: {total_rows:,} | errors: {errors:,} | "
+        f"parts written: {part_num-1:,} | output_prefix: s3://{s3_bucket}/{s3_output_prefix.rstrip('/')}/"
+    )
+
+# -------------------------
+# CONFIG + RUN
+# -------------------------
+if __name__ == "__main__":
+    # REQUIRED
+    S3_BUCKET = "YOUR_BUCKET"
+    S3_INPUT_PREFIX = "your/input/prefix/"          # e.g., "raw/json/"
+    S3_OUTPUT_PREFIX = "your/output/csv_parts/"     # e.g., "processed/flattened_parts/"
+
+    # Top-level columns to keep (NOT nested)
+    COLUMNS_TO_KEEP = ["ID", "Timestamp"]           # add more non-nested columns as needed
+
+    # The only nested column that contains XML-like tags
+    NESTED_COLUMN = "nested_column"
+
+    # TUNING
+    BATCH_SIZE_FILES = 200
+    ROWS_PER_PART = 250_000  # each part file will have up to this many rows
+
+    process_s3_json_to_csv_parts(
+        s3_bucket=S3_BUCKET,
+        s3_input_prefix=S3_INPUT_PREFIX,
+        s3_output_prefix=S3_OUTPUT_PREFIX,
+        columns_to_keep=COLUMNS_TO_KEEP,
+        nested_column=NESTED_COLUMN,
+        batch_size_files=BATCH_SIZE_FILES,
+        rows_per_part=ROWS_PER_PART,
+        sep=".",
+        add_source_columns=True,
+        keep_raw_nested_xml=False,
+        include_header_each_part=True
+    )
