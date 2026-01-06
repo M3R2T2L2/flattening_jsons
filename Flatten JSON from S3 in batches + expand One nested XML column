@@ -1,0 +1,355 @@
+# -----------------------------
+# Flatten JSON from S3 in batches + expand ONE nested XML column
+# Output: CSV written to S3 (supports multipart upload for large files)
+# -----------------------------
+import os
+import json
+import re
+import io
+import math
+import time
+import logging
+from typing import Any, Dict, List, Optional, Iterable, Tuple
+
+import boto3
+import pandas as pd
+from botocore.exceptions import ClientError
+from xml.etree import ElementTree as ET
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+# -------------------------
+# XML helpers
+# -------------------------
+_XML_LIKE_RE = re.compile(r"<[^>]+>.*</[^>]+>", re.DOTALL)
+
+def looks_like_xml(s: Any) -> bool:
+    if not isinstance(s, str):
+        return False
+    s2 = s.strip()
+    if len(s2) < 5:
+        return False
+    return bool(_XML_LIKE_RE.search(s2))
+
+def parse_xml_to_flat_dict(xml_str: str, sep: str = ".", prefix: str = "") -> Dict[str, Any]:
+    """
+    Parse XML string into a flat dict using tag paths.
+    Repeated tags: values joined with " | ".
+    If XML malformed, fallback regex extracts simple <tag>value</tag> pairs.
+    """
+    xml_str = (xml_str or "").strip()
+    out: Dict[str, Any] = {}
+
+    def _add(key: str, val: Any):
+        if key in out and out[key] not in (None, ""):
+            out[key] = f"{out[key]} | {val}"
+        else:
+            out[key] = val
+
+    # Try XML parser
+    try:
+        root = ET.fromstring(xml_str)
+
+        def walk(node: ET.Element, path: List[str]):
+            tag = (node.tag or "").strip()
+            new_path = path + ([tag] if tag else [])
+            txt = (node.text or "").strip()
+            if txt:
+                key = sep.join(new_path)
+                if prefix:
+                    key = f"{prefix}{sep}{key}"
+                _add(key, txt)
+            for child in list(node):
+                walk(child, new_path)
+
+        walk(root, [])
+        return out
+
+    except Exception:
+        pairs = re.findall(r"<([A-Za-z0-9_:\-\.]+)>(.*?)</\1>", xml_str, flags=re.DOTALL)
+        for tag, val in pairs:
+            val2 = re.sub(r"\s+", " ", val).strip()
+            key = tag.strip()
+            if prefix:
+                key = f"{prefix}{sep}{key}"
+            _add(key, val2)
+        return out
+
+# -------------------------
+# S3 listing + reading
+# -------------------------
+def list_s3_keys(s3_client, bucket: str, prefix: str) -> List[str]:
+    keys: List[str] = []
+    token: Optional[str] = None
+
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+
+        resp = s3_client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            k = obj["Key"]
+            # Skip folder placeholders
+            if k.endswith("/"):
+                continue
+            # Only JSON files
+            if k.lower().endswith(".json"):
+                keys.append(k)
+
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+
+    return keys
+
+def read_json_from_s3(s3_client, bucket: str, key: str) -> Any:
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    raw = obj["Body"].read()
+    # try utf-8 first; if weird bytes, replace
+    text = raw.decode("utf-8", errors="replace")
+    return json.loads(text)
+
+def normalize_records(json_data: Any) -> List[Dict[str, Any]]:
+    """
+    Return list of dict records:
+    - top-level list -> list entries (dict entries preferred)
+    - top-level dict -> single record
+    - otherwise -> wrap in {"value": ...}
+    """
+    if isinstance(json_data, list):
+        out = []
+        for x in json_data:
+            out.append(x if isinstance(x, dict) else {"value": x})
+        return out
+    if isinstance(json_data, dict):
+        return [json_data]
+    return [{"value": json_data}]
+
+# -------------------------
+# Record processing
+# -------------------------
+def build_row_from_record(
+    rec: Dict[str, Any],
+    columns_to_keep: List[str],
+    nested_column: str,
+    sep: str = ".",
+    nested_prefix: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Keep only non-nested columns (columns_to_keep) plus expanded XML fields from nested_column.
+    - nested_column is expected to be a string containing XML tags like <col>value</col>
+    - nested_prefix defaults to nested_column (so columns look like nested_column.tag)
+    """
+    row: Dict[str, Any] = {}
+
+    # Keep requested top-level fields (non-nested)
+    for c in columns_to_keep:
+        row[c] = rec.get(c)
+
+    # Expand nested XML column
+    xml_val = rec.get(nested_column)
+    if isinstance(xml_val, str) and looks_like_xml(xml_val):
+        prefix = nested_prefix if nested_prefix is not None else nested_column
+        row.update(parse_xml_to_flat_dict(xml_val, sep=sep, prefix=prefix))
+    else:
+        # Keep the raw nested column if you want traceability (optional).
+        # Comment out next line if you do NOT want raw XML in the output.
+        row[nested_column] = xml_val
+
+    return row
+
+# -------------------------
+# Multipart upload for large CSV
+# -------------------------
+def multipart_upload_bytes(
+    s3_client,
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str = "text/csv",
+    part_size: int = 10 * 1024 * 1024  # 10MB
+) -> None:
+    """
+    Upload bytes to S3 using multipart upload if needed.
+    """
+    if len(data) <= part_size:
+        s3_client.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+        return
+
+    resp = s3_client.create_multipart_upload(Bucket=bucket, Key=key, ContentType=content_type)
+    upload_id = resp["UploadId"]
+    parts = []
+    try:
+        num_parts = math.ceil(len(data) / part_size)
+        for i in range(num_parts):
+            start = i * part_size
+            end = min((i + 1) * part_size, len(data))
+            part_number = i + 1
+            part = s3_client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=data[start:end]
+            )
+            parts.append({"ETag": part["ETag"], "PartNumber": part_number})
+            logging.info(f"Uploaded part {part_number}/{num_parts} ({end-start:,} bytes)")
+
+        s3_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts}
+        )
+    except Exception:
+        logging.exception("Multipart upload failed; aborting.")
+        s3_client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+        raise
+
+# -------------------------
+# Main batch pipeline
+# -------------------------
+def process_s3_json_to_csv(
+    s3_bucket: str,
+    s3_input_prefix: str,
+    s3_output_key: str,
+    columns_to_keep: List[str],
+    nested_column: str,
+    batch_size_files: int = 200,
+    sep: str = ".",
+    write_every_n_rows: int = 200_000,
+    add_source_columns: bool = True
+) -> None:
+    """
+    - Lists JSON files in s3://bucket/prefix
+    - Processes them in batches of files
+    - Keeps only columns_to_keep (top-level) + expands ONE nested xml column (nested_column)
+    - Streams CSV to S3 as a multipart upload at the end (safe for large outputs)
+
+    Notes:
+    - This builds the CSV in-memory chunks; for extremely large outputs, switch to writing to /tmp then upload.
+    """
+    s3 = boto3.client("s3")
+
+    keys = list_s3_keys(s3, s3_bucket, s3_input_prefix)
+    if not keys:
+        raise FileNotFoundError(f"No JSON files found under s3://{s3_bucket}/{s3_input_prefix}")
+
+    logging.info(f"Found {len(keys):,} JSON files under s3://{s3_bucket}/{s3_input_prefix}")
+
+    # We'll accumulate CSV incrementally into a BytesIO buffer to avoid a giant dataframe.
+    # If your output is truly massive, write to a local temp file instead.
+    csv_buffer = io.StringIO()
+    header_written = False
+
+    total_rows = 0
+    total_files = 0
+    errors = 0
+
+    def flush_df_to_csv(df: pd.DataFrame):
+        nonlocal header_written, csv_buffer
+        # append to buffer
+        df.to_csv(csv_buffer, index=False, header=(not header_written))
+        header_written = True
+
+    batch_rows: List[Dict[str, Any]] = []
+
+    for batch_start in range(0, len(keys), batch_size_files):
+        batch_keys = keys[batch_start: batch_start + batch_size_files]
+        logging.info(f"Batch files {batch_start+1:,}-{batch_start+len(batch_keys):,} / {len(keys):,}")
+
+        for k in batch_keys:
+            total_files += 1
+            try:
+                jd = read_json_from_s3(s3, s3_bucket, k)
+                records = normalize_records(jd)
+            except Exception as e:
+                errors += 1
+                logging.exception(f"Failed reading/parsing {k}: {e}")
+                continue
+
+            for i, rec in enumerate(records):
+                if not isinstance(rec, dict):
+                    rec = {"value": rec}
+
+                row = build_row_from_record(
+                    rec=rec,
+                    columns_to_keep=columns_to_keep,
+                    nested_column=nested_column,
+                    sep=sep,
+                    nested_prefix=nested_column  # columns like nested_column.TagName
+                )
+
+                if add_source_columns:
+                    row["_source_key"] = k
+                    row["_source_index"] = i
+
+                batch_rows.append(row)
+                total_rows += 1
+
+                # Periodically write out to CSV buffer to avoid huge list
+                if len(batch_rows) >= write_every_n_rows:
+                    df_chunk = pd.DataFrame(batch_rows)
+                    flush_df_to_csv(df_chunk)
+                    batch_rows = []
+                    logging.info(f"Wrote chunk. Total rows so far: {total_rows:,}")
+
+        # end of batch_keys loop
+        # Optionally flush at end of each file-batch to keep memory stable
+        if batch_rows:
+            df_chunk = pd.DataFrame(batch_rows)
+            flush_df_to_csv(df_chunk)
+            batch_rows = []
+            logging.info(f"Wrote batch chunk. Total rows so far: {total_rows:,}")
+
+    # Upload to S3
+    csv_text = csv_buffer.getvalue()
+    csv_bytes = csv_text.encode("utf-8")
+
+    logging.info(f"Uploading final CSV to s3://{s3_bucket}/{s3_output_key} (bytes={len(csv_bytes):,})")
+    multipart_upload_bytes(
+        s3_client=s3,
+        bucket=s3_bucket,
+        key=s3_output_key,
+        data=csv_bytes,
+        content_type="text/csv",
+        part_size=10 * 1024 * 1024
+    )
+
+    logging.info(
+        f"Done. Files processed: {total_files:,} | rows: {total_rows:,} | errors: {errors:,} | "
+        f"output: s3://{s3_bucket}/{s3_output_key}"
+    )
+
+# -------------------------
+# CONFIG + RUN
+# -------------------------
+if __name__ == "__main__":
+    # REQUIRED
+    S3_BUCKET = "YOUR_BUCKET"
+    S3_INPUT_PREFIX = "your/input/prefix/"   # e.g., "raw/json/"
+    S3_OUTPUT_KEY = "your/output/flattened_output.csv"  # e.g., "processed/flattened.csv"
+
+    # Top-level columns to keep (NOT nested)
+    COLUMNS_TO_KEEP = ["ID", "Timestamp"]  # add more if needed
+
+    # The only nested column that contains XML-like tags
+    NESTED_COLUMN = "nested_column"
+
+    # Optional tuning
+    BATCH_SIZE_FILES = 200            # how many S3 files to read per batch
+    WRITE_EVERY_N_ROWS = 200_000      # flush to CSV buffer every N rows
+
+    process_s3_json_to_csv(
+        s3_bucket=S3_BUCKET,
+        s3_input_prefix=S3_INPUT_PREFIX,
+        s3_output_key=S3_OUTPUT_KEY,
+        columns_to_keep=COLUMNS_TO_KEEP,
+        nested_column=NESTED_COLUMN,
+        batch_size_files=BATCH_SIZE_FILES,
+        write_every_n_rows=WRITE_EVERY_N_ROWS,
+        sep=".",
+        add_source_columns=True
+    )
